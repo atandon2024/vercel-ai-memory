@@ -33,6 +33,7 @@ export type {
   MemoryType,
   VectorMemoryType,
   VectorSimilarity,
+  AutoEmbedOptions,
   DecayPolicy,
   DecayInput,
   TopologyOptions,
@@ -167,7 +168,7 @@ export function createMongoDBMemory(options: MongoDBMemoryOptions): MongoDBMemor
     appName: 'devrel-integration-memory-vercel-typescript',
     driverInfo: DRIVER_INFO,
   })
-  const adapter = new EmbeddingAdapter(options.embedder)
+  const adapter = new EmbeddingAdapter(options.embedder ?? null)
   const store = new MongoMemoryStore(client, adapter, config)
 
   let bootstrapped = false

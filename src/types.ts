@@ -196,6 +196,34 @@ export type VectorMemoryType = 'semantic' | 'procedural' | 'episodic'
 export type VectorSimilarity = 'cosine' | 'dotProduct' | 'euclidean'
 
 /**
+ * Opt-in configuration for **Atlas Automated Embedding**.
+ *
+ * When supplied (instead of a client-side `embedder`), MongoDB Atlas generates
+ * and manages vector embeddings server-side — at index time for stored text and
+ * at query time for search text — using the specified Voyage AI model. No
+ * client embedding pipeline, `queryVector`, or stored `embedding: number[]`
+ * array is used; the store persists the source text in an `embed_text` field
+ * and issues `$vectorSearch` with a `query` string.
+ *
+ * Requirements: Atlas only, Voyage AI enabled for your organization, and
+ * dedicated (`M10+`) clusters must have storage auto-scaling enabled.
+ *
+ * @see https://www.mongodb.com/docs/vector-search/crud-embeddings/automated-embedding.md
+ */
+export interface AutoEmbedOptions {
+  /**
+   * The Voyage AI embedding model used at index time (and, by default, at query
+   * time), e.g. `'voyage-3-large'`.
+   */
+  model: string
+  /**
+   * Optional embedding model to use at query time. Must be compatible with
+   * `model`. Defaults to `model` when omitted.
+   */
+  queryModel?: string
+}
+
+/**
  * Lightweight snapshot of a memory doc passed to `computeExpireAt`.
  * We keep this explicit so users can write a `computeExpireAt` without
  * depending on the full memory interfaces.
@@ -345,10 +373,25 @@ export interface MongoDBMemoryOptions {
   /**
    * Any Vercel AI SDK EmbeddingModel (e.g. from @ai-sdk/openai, @ai-sdk/cohere, etc.).
    * Dimensions are auto-detected on first use via a probe embedding.
+   *
+   * Optional **only** when {@link MongoDBMemoryOptions.autoEmbed} is supplied to
+   * use Atlas Automated Embedding instead of a client-side embedder. Exactly one
+   * of `embedder` / `autoEmbed` must be provided.
+   *
    * @example openai.embedding('text-embedding-3-small')
    * @example cohere.embedding('embed-english-v3.0')
    */
-  embedder: EmbeddingModel
+  embedder?: EmbeddingModel
+  /**
+   * Opt-in **Atlas Automated Embedding** — let MongoDB Atlas generate and manage
+   * embeddings server-side (Voyage AI) instead of a client-side `embedder`.
+   *
+   * Provide exactly one of `embedder` / `autoEmbed`. When omitted, the package
+   * behaves exactly as before (client-side embeddings via `embedder`).
+   *
+   * @see {@link AutoEmbedOptions}
+   */
+  autoEmbed?: AutoEmbedOptions
   /**
    * Database name. Default: `'agent_memory'`.
    * @deprecated Prefer `topology.dbName`. Kept for backward compatibility.
@@ -397,6 +440,14 @@ export interface MemoryConfig {
   dbName: string
   defaultUserId: string
   defaultSessionId: string
+
+  /**
+   * Atlas Automated Embedding config, or `null` for classic client-side
+   * embeddings (the default). When set, the store persists source text in an
+   * `embed_text` field, bootstraps `autoEmbed` vector indexes, and queries with
+   * a `$vectorSearch` `query` string instead of a client `queryVector`.
+   */
+  autoEmbed: AutoEmbedOptions | null
 
   collections: Record<MemoryType, string>
   vectorIndexNames: Record<VectorMemoryType, string>

@@ -1,7 +1,7 @@
 import { defineConfig } from 'tsup'
 
 export default defineConfig({
-  entry: ['src/index.ts'],
+  entry: ['src/index.ts', 'src/eve/index.ts'],
   format: ['esm', 'cjs'],
   outExtension({ format }) {
     return { js: format === 'cjs' ? '.cjs' : '.js' }
@@ -11,5 +11,13 @@ export default defineConfig({
   sourcemap: true,
   clean: true,
   treeshake: true,
-  external: ['ai', 'mongodb', 'zod'],
+  external: [
+    'ai',
+    'mongodb',
+    'zod',
+    'eve',
+    'eve/memory',
+    'eve/memory/scope',
+    'eve/tools',
+  ],
 })

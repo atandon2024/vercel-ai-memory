@@ -84,6 +84,7 @@ export class MongoMemoryStore {
       dbName,
       defaultUserId: 'default',
       defaultSessionId: 'default',
+      autoEmbed: null,
       collections: {
         session: 'session_memory',
         semantic: 'semantic_memory',
@@ -115,6 +116,59 @@ export class MongoMemoryStore {
   /** Return true if the given memory type is enabled. */
   private _enabled(type: MemoryType): boolean {
     return !this.config.disabled.has(type)
+  }
+
+  /** True when this store uses Atlas Automated Embedding (server-side vectors). */
+  private get _isAutoEmbed(): boolean {
+    return this.config.autoEmbed !== null
+  }
+
+  /**
+   * The document field name that holds the vector-search source.
+   * - Client mode: `embedding` (a `number[]` produced by the client embedder).
+   * - Auto-embed mode: `embed_text` (the raw text Atlas embeds server-side).
+   */
+  private get _vectorPath(): string {
+    return this._isAutoEmbed ? 'embed_text' : 'embedding'
+  }
+
+  /**
+   * Build the vector field for a save. In client mode this embeds `text` and
+   * returns `{ embedding }`; in auto-embed mode it returns `{ embed_text: text }`
+   * and lets Atlas embed server-side.
+   */
+  private async _vectorFieldFor(text: string): Promise<Record<string, unknown>> {
+    if (this._isAutoEmbed) return { embed_text: text }
+    return { embedding: await this.embedder.embedText(text) }
+  }
+
+  /**
+   * Build the `$vectorSearch` stage. In client mode it embeds `query` and passes
+   * `queryVector`; in auto-embed mode it passes the `query` text (and optional
+   * `model`) so Atlas embeds server-side.
+   */
+  private async _vectorSearchStage(
+    type: VectorMemoryType,
+    query: string,
+    limit: number,
+    filter: Record<string, unknown>
+  ): Promise<Record<string, unknown>> {
+    const mult = this.config.filtering.numCandidatesMultiplier
+    const base: Record<string, unknown> = {
+      index: this.config.vectorIndexNames[type],
+      path: this._vectorPath,
+      numCandidates: limit * mult,
+      limit,
+      filter,
+    }
+    if (this._isAutoEmbed) {
+      base.query = query
+      const queryModel = this.config.autoEmbed!.queryModel
+      if (queryModel) base.model = queryModel
+    } else {
+      base.queryVector = await this.embedder.embedText(query)
+    }
+    return { $vectorSearch: base }
   }
 
   /** Default TTL field for a given memory type. */
@@ -196,7 +250,9 @@ export class MongoMemoryStore {
     }
 
     // ── Atlas Vector Search indexes ──────────────────────────────────────────
-    const dims = await this.embedder.getDimensions()
+    // In client mode we probe embedding dimensions; in auto-embed mode Atlas
+    // owns dimensions, so we skip the probe entirely.
+    const dims = this._isAutoEmbed ? 0 : await this.embedder.getDimensions()
     if (this._enabled('semantic')) {
       await this._createVectorIndex(
         this.config.collections.semantic,
@@ -281,6 +337,53 @@ export class MongoMemoryStore {
     numDimensions: number,
     filterFields: string[] = []
   ): Promise<void> {
+    // Choose the vector field definition based on embedding mode:
+    // - Auto-embed: `type: 'autoEmbed'` on the `embed_text` field; Atlas owns
+    //   dimensions and embedding generation (Voyage AI `model`).
+    // - Client:     `type: 'vector'` on the `embedding` field with numDimensions.
+    const desiredType = this._isAutoEmbed ? 'autoEmbed' : 'vector'
+    const vectorField = this._isAutoEmbed
+      ? {
+          type: 'autoEmbed',
+          modality: 'text',
+          path: 'embed_text',
+          model: this.config.autoEmbed!.model,
+        }
+      : {
+          type: 'vector',
+          path: 'embedding',
+          numDimensions,
+          similarity: this.config.defaults.similarity,
+        }
+
+    // If an index with this name already exists, check whether it matches the
+    // desired mode. A stale index of the wrong type (e.g. a client-mode
+    // `vector` index left over from a previous run when we now want
+    // `autoEmbed`) would otherwise silently shadow the correct one — the docs
+    // would still be written, but queries would never match. Detect and fix it.
+    const existingType = await this._existingVectorFieldType(collection, indexName)
+    if (existingType) {
+      if (existingType === desiredType) return // already correct — nothing to do
+      // Wrong type for the current embedding mode. Recreate it.
+      // eslint-disable-next-line no-console
+      console.warn(
+        `[mongodb-memory] Vector index "${indexName}" on "${collection}" is ` +
+          `type "${existingType}" but this store is in "${desiredType}" mode. ` +
+          `Dropping and recreating it.`
+      )
+      try {
+        await this.db.command({ dropSearchIndex: collection, name: indexName })
+      } catch (e: unknown) {
+        const msg = e instanceof Error ? e.message : String(e)
+        // eslint-disable-next-line no-console
+        console.warn(
+          `[mongodb-memory] Could not drop stale index "${indexName}" on ` +
+            `"${collection}": ${msg}. Drop it manually if search returns nothing.`
+        )
+        return
+      }
+    }
+
     try {
       await this.db.command({
         createSearchIndexes: collection,
@@ -290,12 +393,7 @@ export class MongoMemoryStore {
             type: 'vectorSearch',
             definition: {
               fields: [
-                {
-                  type: 'vector',
-                  path: 'embedding',
-                  numDimensions,
-                  similarity: this.config.defaults.similarity,
-                },
+                vectorField,
                 ...filterFields.map((path) => ({ type: 'filter', path })),
               ],
             },
@@ -304,9 +402,46 @@ export class MongoMemoryStore {
       })
     } catch (e: unknown) {
       const msg = e instanceof Error ? e.message : String(e)
-      if (!msg.includes('already exists') && !msg.includes('Duplicate')) {
-        console.warn(`[mongodb-memory] Vector index warning (${indexName}): ${msg}`)
-      }
+      if (msg.includes('already exists') || msg.includes('Duplicate')) return
+      // Surface the real reason (e.g. Voyage AI not enabled, invalid model,
+      // unsupported field) instead of failing silently. Bootstrap continues so
+      // one bad index doesn't block the others, but the operator sees why.
+      // eslint-disable-next-line no-console
+      console.warn(
+        `[mongodb-memory] Failed to create vector index "${indexName}" on ` +
+          `"${collection}" (${desiredType} mode): ${msg}`
+      )
+    }
+  }
+
+  /**
+   * Return the vector-field `type` of an existing search index by name
+   * (`'vector'`, `'autoEmbed'`, or the first field's type), or `null` if the
+   * index does not exist or can't be introspected.
+   */
+  private async _existingVectorFieldType(
+    collection: string,
+    indexName: string
+  ): Promise<string | null> {
+    try {
+      const col = this.db.collection(collection)
+      // listSearchIndexes may not exist on very old drivers — guard for it.
+      const lister = (col as unknown as {
+        listSearchIndexes?: (name: string) => { toArray: () => Promise<Array<Record<string, unknown>>> }
+      }).listSearchIndexes
+      if (typeof lister !== 'function') return null
+      const indexes = await lister.call(col, indexName).toArray()
+      const idx = indexes.find((i) => i.name === indexName)
+      if (!idx) return null
+      const def = (idx.latestDefinition ?? idx.definition) as
+        | { fields?: Array<{ type?: string }> }
+        | undefined
+      const fields = def?.fields ?? []
+      const vf = fields.find((f) => f.type === 'vector' || f.type === 'autoEmbed')
+      return vf?.type ?? fields[0]?.type ?? null
+    } catch {
+      // Best-effort introspection; if it fails, fall through to create.
+      return null
     }
   }
 
@@ -414,7 +549,7 @@ export class MongoMemoryStore {
     if (!this._enabled('semantic')) {
       throw new Error('[mongodb-memory] Semantic memory is disabled')
     }
-    const embedding = await this.embedder.embedText(`${name}: ${description}`)
+    const vectorField = await this._vectorFieldFor(`${name}: ${description}`)
     const now = new Date()
     const importance = opts?.importance ?? this.config.defaults.importance
 
@@ -436,14 +571,14 @@ export class MongoMemoryStore {
         name,
         category: 'semantic',
         description,
-        embedding,
+        ...vectorField,
         importance,
         stats: defaultStats(),
         timestamp: now,
         is_latest: true,
         tags: opts?.tags,
         ...(expireAt ? { expire_at: expireAt } : {}),
-      })
+      } as unknown as SemanticMemory)
     } else {
       // In-place upsert: single document per (user_id, name).
       await this.semantic.updateOne(
@@ -451,7 +586,7 @@ export class MongoMemoryStore {
         {
           $set: {
             description,
-            embedding,
+            ...vectorField,
             importance,
             timestamp: now,
             is_latest: true,
@@ -477,20 +612,13 @@ export class MongoMemoryStore {
     limit = this.config.defaults.searchLimit
   ): Promise<SemanticMemory[]> {
     if (!this._enabled('semantic')) return []
-    const queryVector = await this.embedder.embedText(query)
-    const mult = this.config.filtering.numCandidatesMultiplier
+    const stage = await this._vectorSearchStage('semantic', query, limit, {
+      user_id: { $eq: userId },
+      is_latest: { $eq: true },
+    })
     const results = await this.semantic
       .aggregate<SemanticMemory>([
-        {
-          $vectorSearch: {
-            index: this.config.vectorIndexNames.semantic,
-            path: 'embedding',
-            queryVector,
-            numCandidates: limit * mult,
-            limit,
-            filter: { user_id: { $eq: userId }, is_latest: { $eq: true } },
-          },
-        },
+        stage,
         ...this._postFilterStages(),
         { $project: { embedding: 0 } },
       ])
@@ -515,7 +643,7 @@ export class MongoMemoryStore {
     if (!this._enabled('procedural')) {
       throw new Error('[mongodb-memory] Procedural memory is disabled')
     }
-    const embedding = await this.embedder.embedText(`${task}: ${description}`)
+    const vectorField = await this._vectorFieldFor(`${task}: ${description}`)
     const now = new Date()
     const importance = opts?.importance ?? this.config.defaults.importance
     const source = opts?.source ?? 'agent_learned'
@@ -538,14 +666,14 @@ export class MongoMemoryStore {
         task,
         category: 'procedural',
         description,
-        embedding,
+        ...vectorField,
         importance,
         stats: defaultStats(),
         source,
         timestamp: now,
         is_latest: true,
         ...(expireAt ? { expire_at: expireAt } : {}),
-      })
+      } as unknown as ProceduralMemory)
     } else {
       // In-place upsert: single document per (user_id, task).
       await this.procedural.updateOne(
@@ -553,7 +681,7 @@ export class MongoMemoryStore {
         {
           $set: {
             description,
-            embedding,
+            ...vectorField,
             importance,
             source,
             timestamp: now,
@@ -579,20 +707,13 @@ export class MongoMemoryStore {
     limit = this.config.defaults.searchLimit
   ): Promise<ProceduralMemory[]> {
     if (!this._enabled('procedural')) return []
-    const queryVector = await this.embedder.embedText(query)
-    const mult = this.config.filtering.numCandidatesMultiplier
+    const stage = await this._vectorSearchStage('procedural', query, limit, {
+      user_id: { $eq: userId },
+      is_latest: { $eq: true },
+    })
     const results = await this.procedural
       .aggregate<ProceduralMemory>([
-        {
-          $vectorSearch: {
-            index: this.config.vectorIndexNames.procedural,
-            path: 'embedding',
-            queryVector,
-            numCandidates: limit * mult,
-            limit,
-            filter: { user_id: { $eq: userId }, is_latest: { $eq: true } },
-          },
-        },
+        stage,
         ...this._postFilterStages(),
         { $project: { embedding: 0 } },
       ])
@@ -617,7 +738,7 @@ export class MongoMemoryStore {
     if (!this._enabled('episodic')) {
       throw new Error('[mongodb-memory] Episodic memory is disabled')
     }
-    const embedding = await this.embedder.embedText(`${eventType}: ${description}`)
+    const vectorField = await this._vectorFieldFor(`${eventType}: ${description}`)
     const id = new ObjectId()
     const now = new Date()
     const importance = opts?.importance ?? this.config.defaults.importance
@@ -633,15 +754,31 @@ export class MongoMemoryStore {
       event_type: eventType,
       category: 'episodic',
       description,
-      embedding,
+      ...vectorField,
       importance,
       stats: defaultStats(),
       context: opts?.context,
       timestamp: now,
       ...(expireAt ? { expire_at: expireAt } : {}),
-    })
+    } as unknown as EpisodicMemory)
 
     return id
+  }
+
+  /**
+   * Return true if at least one episodic doc for `userId` matches `filter`.
+   * Used by the Eve adapter to make replayed captures idempotent.
+   */
+  async episodicExists(
+    userId: string,
+    filter: Record<string, unknown>
+  ): Promise<boolean> {
+    if (!this._enabled('episodic')) return false
+    const doc = await this.episodic.findOne(
+      { user_id: userId, ...filter } as Filter<EpisodicMemory>,
+      { projection: { _id: 1 } }
+    )
+    return doc !== null
   }
 
   async episodicSearch(
@@ -650,20 +787,12 @@ export class MongoMemoryStore {
     limit = this.config.defaults.searchLimit
   ): Promise<EpisodicMemory[]> {
     if (!this._enabled('episodic')) return []
-    const queryVector = await this.embedder.embedText(query)
-    const mult = this.config.filtering.numCandidatesMultiplier
+    const stage = await this._vectorSearchStage('episodic', query, limit, {
+      user_id: { $eq: userId },
+    })
     const results = await this.episodic
       .aggregate<EpisodicMemory>([
-        {
-          $vectorSearch: {
-            index: this.config.vectorIndexNames.episodic,
-            path: 'embedding',
-            queryVector,
-            numCandidates: limit * mult,
-            limit,
-            filter: { user_id: { $eq: userId } },
-          },
-        },
+        stage,
         ...this._postFilterStages(),
         { $project: { embedding: 0 } },
       ])

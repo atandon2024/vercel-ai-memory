@@ -1,10 +1,12 @@
 # `@mongodb-developer/vercel-ai-memory`
 
-MongoDB-backed persistent memory for the [Vercel AI SDK](https://sdk.vercel.ai). Gives your agent five structured memory tiers — **Session**, **Semantic**, **Procedural**, **Episodic**, and **Scratchpad** — all stored in MongoDB Atlas with automatic vector search indexes and per-type retention policies.
+MongoDB-backed persistent memory for the [Vercel AI SDK](https://sdk.vercel.ai) and a **first-class memory provider for [Vercel Eve](https://eve.dev)**. Gives your agent five structured memory tiers — **Session**, **Semantic**, **Procedural**, **Episodic**, and **Scratchpad** — all stored in MongoDB Atlas with automatic vector search indexes and per-type retention policies. Bring your own embedding model, or let **Atlas Automated Embedding** (Voyage AI) generate vectors server-side with zero client embedding pipeline.
 
 ## Features
 
 - 🧠 **5 memory types** — session history, entity knowledge, how-to procedures, event episodes, and a temporary scratchpad
+- 🤖 **Vercel Eve provider** — drop-in `mongodbMemory()` for Eve's memory slots via the `/eve` subpath: automatic recall before every turn, automatic or agent-driven capture, and `remember` / `forget` tools — all partitioned by Eve's trusted scope key
+- ⚡ **Atlas Automated Embedding** — opt in with `autoEmbed: { model: 'voyage-4' }` and Atlas embeds your memories server-side (Voyage AI); no embedding API key or client pipeline required
 - 🔍 **Atlas Vector Search** — semantic retrieval powered by any Vercel AI SDK embedding model
 - 📏 **Auto-detected dimensions** — no need to configure vector dimensions; the package probes them at startup
 - ⏱️ **Flexible retention** — per-type policies: `none`, `ttl`, `ttl+importance`, or fully `dynamic` (forgetting curve)
@@ -142,6 +144,120 @@ assistant tool call.
 See `examples/deterministic-agent.ts` for the full runnable example.
 
 > **Note:** The other memory tiers (semantic, procedural, episodic, scratchpad) are intentionally left under LLM control — they should be selective and content-dependent, not every-turn.
+
+## Vercel Eve
+
+MongoDB is also available as a **first-class [Vercel Eve](https://eve.dev) memory provider** via the additive `/eve` subpath — layered on top of the exact same store, embeddings, vector search, retention, and forgetting logic used by the AI SDK integration.
+
+```bash
+npm install @mongodb-developer/vercel-ai-memory eve
+```
+
+> `eve` is an **optional peer dependency**. If you only use the AI SDK integration (the root import), you don't need to install `eve`, and it is never bundled into the root entrypoint.
+
+```ts
+// agent/memory/profile.ts
+import { defineMemory } from 'eve/memory'
+import { byPrincipal } from 'eve/memory/scope'
+import { mongodbMemory } from '@mongodb-developer/vercel-ai-memory/eve'
+
+export default defineMemory({
+  scope: byPrincipal,
+  provider: mongodbMemory({
+    uri: process.env.MONGODB_URI!,
+    embedder,
+    capture: 'automatic',
+  }),
+})
+```
+
+That's the whole integration. Eve owns the agent runtime and lifecycle; MongoDB provides persistent, personalized, cross-session memory. You don't write `remember.ts`, `recall.ts`, `semantic_search.ts`, `episodic_search.ts`, or `forget.ts` — the provider handles all of it.
+
+### How it maps to the Eve provider contract
+
+| Eve surface | What MongoDB does |
+| --- | --- |
+| `recall["turn.started"]` | Parallel semantic / episodic / procedural vector search, returned as recalled messages before the model responds — automatically. |
+| `capture["turn.completed"]` | (When `capture: "automatic"`) extracts & classifies durable memories and stores them. |
+| `tools` | Exposes `remember` and `forget` (Eve qualifies them as `profile__remember`, `profile__forget`). |
+
+### Trusted scope (security)
+
+The MongoDB owner/user id is **never** supplied by the model. The adapter uses Eve's trusted `ctx.memory.scope.key` as the partition key for **every** read and write:
+
+```ts
+const scope = ctx.memory.scope.key
+store.semanticSearch(scope, query)        // recall
+store.semanticSave(scope, name, content)  // capture / remember
+```
+
+Two principals therefore can never retrieve each other's memories.
+
+### Stable identity in local dev (read this before you think memory is broken)
+
+Eve's partition key is a digest of **namespace + scope**. *Both* must be stable across runs or the agent will write to a fresh, empty partition every time and never recall anything:
+
+- **`scope`** — `byPrincipal` uses the authenticated caller. In the local dev TUI and `eve invoke` there is no real auth, so the anonymous principal changes between runs. Pin a stable dev id.
+- **`namespace`** — when omitted, Eve's default namespace includes a hash of the **build root** (`.eve/builds/<id>/…`), which changes on every `eve dev` / `eve invoke` start. So even with a pinned scope, the key still changes each run. Set an explicit namespace.
+
+```ts
+const scope = (ctx) =>
+  process.env.EVE_MEMORY_PROD ? byPrincipal(ctx) : [process.env.DEV_PRINCIPAL_ID ?? 'dev-user']
+
+export default defineMemory({
+  namespace: 'my-agent/profile',   // stable across builds & restarts
+  scope,                            // stable in dev, real per-user in prod
+  provider: mongodbMemory({ /* … */ }),
+})
+```
+
+You can confirm the partition is stable with `eve traces`: `gen_ai.memory.store.id` should be identical across invocations, and `gen_ai.memory.record.count` should be `> 0` in a brand-new session once you've saved something. See [`examples/eve-grove`](examples/eve-grove) for the full runnable setup.
+
+### Capture modes
+
+| Mode | Behavior |
+| --- | --- |
+| `"automatic"` *(default)* | After each turn, extract & classify durable memories and store them. Provide `captureModel` for full LLM classification; without one, a lightweight heuristic fallback is used and a one-time notice is logged. |
+| `"agent"` | The model decides via the `profile__remember` / `profile__forget` tools. |
+| `false` | Recall only; no automatic capture. |
+
+### Options
+
+```ts
+mongodbMemory({
+  uri: process.env.MONGODB_URI!,
+  embedder,                        // or: autoEmbed: { model: 'voyage-3-large' }
+  capture: 'automatic',            // 'automatic' | 'agent' | false
+  captureModel,                    // optional LanguageModel for automatic capture
+  memory: { semantic: true, episodic: true, procedural: true },
+  recall: { limit: 8, minSimilarity: 0.72 },
+  retention: { episodic: { mode: 'ttl', ttlSeconds: 60 * 60 * 24 * 90 } },
+})
+```
+
+Session and scratchpad tiers are intentionally disabled inside the Eve adapter because Eve owns the session/runtime lifecycle. This is Eve-adapter-only and does **not** change the AI SDK integration.
+
+## Atlas Automated Embedding (opt-in)
+
+Both the AI SDK integration and the Eve adapter can let **MongoDB Atlas generate and manage embeddings server-side** (Voyage AI) — no client embedding pipeline. Pass `autoEmbed` instead of `embedder`:
+
+```ts
+createMongoDBMemory({
+  uri: process.env.MONGODB_URI!,
+  autoEmbed: { model: 'voyage-3-large' },
+})
+
+// or in Eve:
+mongodbMemory({ uri: process.env.MONGODB_URI!, autoEmbed: { model: 'voyage-3-large' } })
+```
+
+In this mode the store persists the source text (`embed_text`), bootstraps `autoEmbed` vector indexes, and issues `$vectorSearch` with a `query` string. Provide **exactly one** of `embedder` / `autoEmbed`.
+
+A full runnable agent example lives in [`examples/auto-embed-agent.ts`](examples/auto-embed-agent.ts) — it's the auto-embedding twin of `examples/basic-agent.ts` (same multi-tenant `ToolLoopAgent`, just `autoEmbed: { model: 'voyage-4' }` instead of a client `embedder`). Run it with `npx tsx examples/auto-embed-agent.ts`.
+
+> Requires MongoDB Atlas with Voyage AI enabled for your organization. On dedicated (`M10+`) clusters, enable storage auto-scaling. See the [Automated Embedding docs](https://www.mongodb.com/docs/vector-search/crud-embeddings/automated-embedding.md).
+
+> **Verifying it works.** An Atlas-gated integration test exercises this path end-to-end (`tests/integration/auto-embed.test.ts`): it bootstraps `type:"autoEmbed"` indexes (model `voyage-4`, path `embed_text`), asserts each `*Save` persists `embed_text` (and no client `embedding` array), and confirms each `*Search` ranks the relevant doc via server-side embeddings — including through the AI SDK `memory` tool. Run it with `MONGODB_URI="mongodb+srv://…" npm run test:integration`. It runs against an isolated database (`agent_memory_autoembed_test`) so its `autoEmbed` indexes never collide with the default client-mode `vector` indexes. If Voyage AI / Automated Embedding (Preview) is **not** enabled for your org, `createSearchIndexes` fails — the store logs `[mongodb-memory] Failed to create vector index …`, and the index/search assertions are skipped with a clear reason (the persistence assertions still run).
 
 ## Configuration
 

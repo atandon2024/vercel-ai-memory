@@ -1,0 +1,25 @@
+{
+  "name": "eve-grove-memory-agent",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=24"
+  },
+  "scripts": {
+    "dev": "eve dev",
+    "build": "eve build",
+    "start": "eve start",
+    "doctor": "node scripts/doctor.mjs"
+  },
+  "dependencies": {
+    "@ai-sdk/openai-compatible": "^1.0.0",
+    "@mongodb-developer/vercel-ai-memory": "file:../..",
+    "ai": "^7.0.0",
+    "eve": "latest",
+    "mongodb": "^7.0.0",
+    "zod": "^3.25.76"
+  },
+  "devDependencies": {
+    "microsandbox": "^0.5.10"
+  }
+}

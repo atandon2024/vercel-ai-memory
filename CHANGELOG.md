@@ -5,6 +5,74 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.0] — 2026-09-15
+
+### Added
+- **First-class Vercel Eve memory provider** — a new, additive subpath export
+  `@mongodb-developer/vercel-ai-memory/eve` exposing `mongodbMemory()` (aliased
+  as `mongodb()`). It implements the Eve memory provider contract
+  (`recall["turn.started"]`, optional `capture["turn.completed"]`, and provider
+  `tools`) as a thin adapter over the existing `MongoMemoryStore`.
+  - **Automatic relevant recall** before each turn across the semantic,
+    episodic, and procedural tiers.
+  - **Capture modes**: `"automatic"` (default, matching the Supermemory /
+    Upstash AgentKit convention — extracts & classifies durable memories via an
+    optional `captureModel`, with a heuristic fallback when none is supplied),
+    `"agent"` (model-driven `remember` / `forget` tools), and `false`
+    (recall only).
+  - **Trusted scope isolation**: every read and write is partitioned by the
+    Eve-supplied `ctx.memory.scope.key` (used as the store `userId`). The model
+    can never provide or choose the memory owner.
+  - Eve owns the session/runtime lifecycle, so the adapter disables the
+    session + scratchpad tiers. This applies **only** to the Eve adapter.
+  - `eve` is declared as an **optional peer dependency** — existing AI SDK users
+    who never import `/eve` are not required to install it, and the root bundle
+    contains no `eve` imports.
+- **Opt-in Atlas Automated Embedding** for the core store — pass
+  `autoEmbed: { model }` (instead of `embedder`) to let MongoDB Atlas generate
+  and manage vector embeddings server-side (Voyage AI). Available to both the
+  AI SDK integration and the Eve adapter. Requires Atlas with Voyage AI enabled
+  and (on dedicated `M10+` clusters) storage auto-scaling.
+
+### Changed
+- `MongoDBMemoryOptions.embedder` is now **optional** — required only when
+  `autoEmbed` is not supplied. Exactly one of `embedder` / `autoEmbed` must be
+  provided. **No behavior change** for existing users who pass `embedder`.
+- **Eve adapter: capture is now idempotent on `ctx.operationId`.** The Eve
+  provider contract states that eve may replay a handler with the same
+  `operationId`. Semantic and procedural captures were already replay-safe
+  (upsert on `(scope, label)`), but episodic captures used a plain insert and
+  would duplicate the event on replay. Episodic memories written by
+  `capture["turn.completed"]` are now tagged with `context.eve_operation_id`
+  and a replayed operation is a no-op. Adds `MongoMemoryStore.episodicExists()`.
+- **Eve adapter: `remember` tool accepts confidence-style importance.** Models
+  frequently emit `importance` as a 0–1 fraction (observed with GROVE:
+  `importance: 0.9`). The tool schema previously required `1–10` and rejected
+  the call (`AI_InvalidToolInputError`), costing a wasted tool round-trip and
+  losing the score. Values in `0 < x <= 1` are now scaled to `1–10`; out-of-range
+  values are clamped; integers pass through unchanged.
+- **Eve adapter: quieter logs.** The "memory type … is disabled" operator
+  notice is no longer emitted for the Eve provider, where disabling the session
+  and scratchpad tiers is by design (Eve owns the session lifecycle). The
+  notice is unchanged for the root AI SDK integration. `resolveConfig()` gains
+  an internal `{ quietDisabledNotices }` option.
+
+### Fixed
+- **`examples/eve-grove`: memory did not persist across runs.** Eve's memory
+  partition key is a digest of *namespace + scope*. When `namespace` is omitted,
+  Eve's default namespace includes a hash of the build root (`.eve/builds/<id>`),
+  which changes on every `eve dev` / `eve invoke` — so even with a pinned scope
+  the agent wrote to a fresh partition each run and never recalled anything.
+  The example now sets an explicit, stable `namespace` alongside the stable dev
+  `scope`. (Verified with `eve traces`: `gen_ai.memory.store.id` is now constant
+  and `gen_ai.memory.record.count` > 0 in a brand-new session.)
+
+### Compatibility
+- Fully backward compatible. `createMongoDBMemory`, the AI SDK memory tool, all
+  store APIs, memory types, session/scratchpad behavior, configuration defaults,
+  and existing exports are unchanged. All existing tests pass unmodified.
+
+
 ## [0.4.2] — 2026-06-24
 
 ### Added

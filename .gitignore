@@ -4,6 +4,9 @@ node_modules/
 # Build output
 dist/
 *.tsbuildinfo
+# Eve build/dev artifacts (examples/eve-grove)
+.eve/
+.output/
 
 # Test / coverage
 coverage/

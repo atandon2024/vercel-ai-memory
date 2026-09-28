@@ -16,6 +16,13 @@ let _bootstrapped = false
 
 export async function getTestClient(): Promise<MongoClient> {
   if (_client) return _client
+  if (!ATLAS_URI) {
+    throw new Error(
+      '[test] MONGODB_URI is not set. Integration tests require a live MongoDB ' +
+        'Atlas connection string, e.g.:\n\n' +
+        '  MONGODB_URI="mongodb+srv://…" npm run test:integration\n'
+    )
+  }
   _client = new MongoClient(ATLAS_URI, {
     appName: 'devrel-integration-memory-vercel-typescript',
   })

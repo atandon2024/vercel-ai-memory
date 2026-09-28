@@ -65,9 +65,36 @@ const DEFAULT_DEFAULTS: Required<MemoryConfig['defaults']> = {
  * consume a `MemoryConfig`. Calling with an empty options object (other than
  * the two required fields) reproduces the original hardcoded behavior exactly.
  */
-export function resolveConfig(options: MongoDBMemoryOptions): MemoryConfig {
+export function resolveConfig(
+  options: MongoDBMemoryOptions,
+  internal?: {
+    /**
+     * Suppress the one-time console notices for disabled / hidden memory types.
+     * Used by the Eve adapter, where disabling session + scratchpad is by design
+     * (Eve owns the session lifecycle) and the notice would only be noise.
+     */
+    quietDisabledNotices?: boolean
+  }
+): MemoryConfig {
   if (!options.uri) throw new Error('[mongodb-memory] `uri` is required')
-  if (!options.embedder) throw new Error('[mongodb-memory] `embedder` is required')
+
+  // Embedding mode: exactly one of `embedder` (client-side) or `autoEmbed`
+  // (Atlas Automated Embedding) must be provided. Defaulting: when neither is
+  // set we preserve the original error (embedder required) for backward compat.
+  const hasEmbedder = !!options.embedder
+  const hasAutoEmbed = !!options.autoEmbed
+  if (hasEmbedder && hasAutoEmbed) {
+    throw new Error(
+      '[mongodb-memory] Provide exactly one of `embedder` or `autoEmbed` — not both.'
+    )
+  }
+  if (!hasEmbedder && !hasAutoEmbed) {
+    throw new Error('[mongodb-memory] `embedder` is required')
+  }
+  if (hasAutoEmbed && !options.autoEmbed!.model) {
+    throw new Error('[mongodb-memory] `autoEmbed.model` is required')
+  }
+  const autoEmbed = options.autoEmbed ?? null
 
   // dbName precedence: topology.dbName > legacy dbName > default
   const dbName =
@@ -129,29 +156,32 @@ export function resolveConfig(options: MongoDBMemoryOptions): MemoryConfig {
   validateDefaults(defaults)
 
   // Emit a one-time warning for each disabled type so operators see it in logs.
-  for (const t of disabled) {
-    // eslint-disable-next-line no-console
-    console.warn(
-      `[mongodb-memory] Memory type "${t}" is disabled — its tool commands ` +
-        `will be removed from the memory tool schema and its collection will ` +
-        `not be bootstrapped.`
-    )
-  }
-  // Separate, quieter notice for types that are live-but-hidden from the tool.
-  for (const t of hiddenFromTool) {
-    if (disabled.has(t)) continue
-    // eslint-disable-next-line no-console
-    console.info(
-      `[mongodb-memory] Memory type "${t}" is hidden from the tool schema ` +
-        `but its store and collection remain active (expected when using ` +
-        `runtime hooks).`
-    )
+  if (!internal?.quietDisabledNotices) {
+    for (const t of disabled) {
+      // eslint-disable-next-line no-console
+      console.warn(
+        `[mongodb-memory] Memory type "${t}" is disabled — its tool commands ` +
+          `will be removed from the memory tool schema and its collection will ` +
+          `not be bootstrapped.`
+      )
+    }
+    // Separate, quieter notice for types that are live-but-hidden from the tool.
+    for (const t of hiddenFromTool) {
+      if (disabled.has(t)) continue
+      // eslint-disable-next-line no-console
+      console.info(
+        `[mongodb-memory] Memory type "${t}" is hidden from the tool schema ` +
+          `but its store and collection remain active (expected when using ` +
+          `runtime hooks).`
+      )
+    }
   }
 
   return {
     dbName,
     defaultUserId: options.userId ?? 'default',
     defaultSessionId: options.sessionId ?? 'default',
+    autoEmbed,
     collections,
     vectorIndexNames,
     disabled,

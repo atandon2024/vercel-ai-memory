@@ -1,11 +1,13 @@
 {
   "name": "@mongodb-developer/vercel-ai-memory",
-  "version": "0.4.2",
-  "description": "MongoDB-backed persistent memory provider for the Vercel AI SDK — Session, Semantic, Procedural, Episodic, and Scratchpad memory with Atlas Vector Search.",
+  "version": "0.5.0",
+  "description": "MongoDB-backed persistent memory provider for the Vercel AI SDK and Vercel Eve — Session, Semantic, Procedural, Episodic, and Scratchpad memory with Atlas Vector Search (optional Atlas Automated Embedding).",
   "keywords": [
     "mongodb",
     "vercel-ai",
     "ai-sdk",
+    "eve",
+    "vercel-eve",
     "memory",
     "agent-memory",
     "vector-search",
@@ -35,6 +37,16 @@
         "types": "./dist/index.d.cts",
         "default": "./dist/index.cjs"
       }
+    },
+    "./eve": {
+      "import": {
+        "types": "./dist/eve/index.d.mts",
+        "default": "./dist/eve/index.js"
+      },
+      "require": {
+        "types": "./dist/eve/index.d.ts",
+        "default": "./dist/eve/index.cjs"
+      }
     }
   },
   "files": [
@@ -55,8 +67,14 @@
   },
   "peerDependencies": {
     "ai": "^6.0.0 || ^7.0.0",
+    "eve": ">=0.5.0",
     "mongodb": "^6.0.0 || ^7.0.0",
     "zod": "^3.25.76 || ^4.1.8"
+  },
+  "peerDependenciesMeta": {
+    "eve": {
+      "optional": true
+    }
   },
   "devDependencies": {
     "@types/node": "^22.0.0",
