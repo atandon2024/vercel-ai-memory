@@ -1,0 +1,124 @@
+name: SBOM
+
+# DRAFT. Generates a CycloneDX SBOM and uploads it to Kondukto with SilkBomb 2.0.
+# Pattern copied from mongodb/awscdk-resources-mongodbatlas and mongodb/atlas-sdk-go.
+#
+# Required repo configuration (Settings > Secrets and variables > Actions):
+#   secret   KONDUKTO_TOKEN   standalone token from the DSE team (delivered via PrivateBin)
+#   variable ECR_ROLE_ARN     AWS role for GitHub OIDC, from DevProd Platforms
+#   variable ECR_REGISTRY     901841024863.dkr.ecr.us-east-1.amazonaws.com
+#   variable SILKBOMB_IMG     901841024863.dkr.ecr.us-east-1.amazonaws.com/release-infrastructure/silkbomb:2.0
+#   variable KONDUKTO_REPO    Kondukto project name (confirm exact form: org_repo vs org/repo)
+# See https://docs.devprod.prod.corp.mongodb.com/devprod-platforms-ecr
+
+on:
+  push:
+    branches:
+      - main
+  release:
+    types: [published]
+  # Bot-created tags (tag-on-merge.yml) don't trigger release/tag workflows, so tag-on-merge.yml
+  # can call this via `uses: ./.github/workflows/sbom.yml` with release: true.
+  workflow_call:
+    inputs:
+      release:
+        type: boolean
+        default: true
+    secrets:
+      KONDUKTO_TOKEN:
+        required: true
+  workflow_dispatch:
+    inputs:
+      release:
+        description: 'Also run augment and attach SBOM (release step)'
+        type: boolean
+        default: false
+
+env:
+  SILKBOMB_IMG: ${{ vars.SILKBOMB_IMG }}
+  KONDUKTO_REPO: ${{ vars.KONDUKTO_REPO }}
+  KONDUKTO_BRANCH: main
+  IS_RELEASE: ${{ github.event_name == 'release' || inputs.release == true }}
+
+jobs:
+  sbom:
+    name: Generate SBOM and upload to Kondukto
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write   # attach SBOM to the GitHub Release
+      id-token: write   # AWS OIDC for ECR
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      # This package has no `dependencies`: it ships only dist/ and users supply ai, mongodb,
+      # zod and eve (optional) as peers. The repo lockfile is dev tooling, so build the SBOM
+      # from the peer dependencies (and their transitives) in a scratch manifest instead.
+      - name: Resolve peer dependencies
+        run: |
+          mkdir sbom-src
+          jq '{name, version, private: true, dependencies: .peerDependencies}' package.json > sbom-src/package.json
+          npm install --package-lock-only --ignore-scripts --no-audit --no-fund --prefix sbom-src
+
+      # Every component must carry a purl or Kondukto silently drops it.
+      - name: Generate CycloneDX SBOM
+        run: npx --yes @cyclonedx/cdxgen@latest -t npm --required-only --spec-version 1.5 -o sbom.json sbom-src
+
+      - name: Sanity-check SBOM
+        run: |
+          missing=$(jq '[.components[] | select(.purl == null)] | length' sbom.json)
+          total=$(jq '.components | length' sbom.json)
+          echo "components: $total, without purl: $missing"
+          test "$total" -gt 0
+          test "$missing" -eq 0
+
+      - name: Configure AWS credentials for DevProd Platforms ECR
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.ECR_ROLE_ARN }}
+          aws-region: us-east-1
+
+      - name: Authenticate Docker to DevProd Platforms ECR
+        run: |
+          aws ecr get-login-password --region us-east-1 |
+            docker login --username AWS --password-stdin "${{ vars.ECR_REGISTRY }}"
+          docker pull "$SILKBOMB_IMG"
+
+      - name: Upload SBOM to Kondukto
+        env:
+          KONDUKTO_TOKEN: ${{ secrets.KONDUKTO_TOKEN }}
+        run: |
+          docker run --rm -v "$PWD:/pwd" -e KONDUKTO_TOKEN "$SILKBOMB_IMG" \
+            upload --sbom-in /pwd/sbom.json \
+            --repo "$KONDUKTO_REPO" --branch "$KONDUKTO_BRANCH"
+
+      # Release only: pull Kondukto scan results into the SBOM.
+      - name: Augment SBOM
+        if: env.IS_RELEASE == 'true'
+        env:
+          KONDUKTO_TOKEN: ${{ secrets.KONDUKTO_TOKEN }}
+        run: |
+          docker run --rm -v "$PWD:/pwd" -e KONDUKTO_TOKEN "$SILKBOMB_IMG" \
+            augment --sbom-in /pwd/sbom.json \
+            --repo "$KONDUKTO_REPO" --branch "$KONDUKTO_BRANCH" \
+            --sbom-out /pwd/sbom.augmented.json
+
+      - name: Upload SBOM artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom
+          path: sbom*.json
+
+      # TODO: SSDLC compliance report (see the reference repos' scripts/compliance/gen-ssdlc-report.sh
+      # and the SSDLC_COMPLIANCE_REPORT_TEMPLATE doc) and where to promote it.
+      - name: Attach augmented SBOM to GitHub Release
+        if: github.event_name == 'release'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: sbom.augmented.json
