@@ -46,7 +46,7 @@ jobs:
     if: needs.tag.outputs.created == 'true'
     uses: ./.github/workflows/publish.yml
     permissions:
-      contents: read
+      contents: write
       id-token: write
     secrets:
       NPM_TOKEN: ${{ secrets.NPM_TOKEN }}

@@ -19,8 +19,8 @@ jobs:
     name: Build & publish
     runs-on: ubuntu-latest
     permissions:
-      contents: read
-      id-token: write  # required for npm provenance
+      contents: write  # attach tarball + signature to the GitHub Release
+      id-token: write  # required for npm provenance and AWS OIDC
 
     steps:
       - name: Checkout
@@ -50,6 +50,7 @@ jobs:
         run: |
           tarball=$(npm pack --json | jq -r '.[0].filename')
           echo "tarball=$tarball" >> "$GITHUB_OUTPUT"
+          echo "version=$(jq -c '.version' package.json)" >> "$GITHUB_OUTPUT"
 
       # Sign with Garasign (HSM-backed PGP). Credentials are passed through the environment,
       # never as command-line arguments. Needs vars ECR_ROLE_ARN / ECR_REGISTRY from DevProd
@@ -91,3 +92,14 @@ jobs:
         run: npm publish "${{ steps.pack.outputs.tarball }}" --access public --provenance
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+      # Make the signature publicly available next to the release so users can verify the
+      # package (the SSDLC compliance report links to it). The workflow artifact above expires
+      # and needs a GitHub login, so it is not a distribution location.
+      - name: Attach tarball and signature to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ fromJSON(steps.pack.outputs.version) }}
+          files: |
+            ${{ steps.pack.outputs.tarball }}
+            ${{ steps.pack.outputs.tarball }}.sig
