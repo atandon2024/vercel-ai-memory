@@ -1,7 +1,7 @@
 name: Release setup
 description: >-
   Assume the AWS signing role through GitHub OIDC, log in to the Garasign ECR
-  registry, and load the Garasign credentials from AWS Secrets Manager into a
+  registry, and write the Garasign credentials from AWS Secrets Manager to a
   private env file for the sign-artifacts action.
   Adapted from mongodb-developer/claude-agent-sdk-mongodb-session-store#8.
 
@@ -14,8 +14,9 @@ inputs:
     required: true
   aws_secret_id:
     description: >-
-      AWS Secrets Manager secret id. Its JSON must contain garasign-username
-      and garasign-password, and gpg-key-id; gpg-public-url is optional.
+      AWS Secrets Manager secret id or ARN. Its JSON must contain
+      garasign-username and garasign-password; gpg-key-id is optional and, when
+      set, sign-artifacts checks that signatures were made with that key.
     required: true
   ecr_registry_id:
     description: AWS account id of the ECR registry that hosts the Garasign images.
@@ -51,38 +52,23 @@ runs:
         role-session-name: release-signing-secrets
         aws-region: ${{ inputs.aws_region }}
 
+    # The blank alias (leading comma) names the variables after the JSON keys only:
+    # garasign-username -> GARASIGN_USERNAME, gpg-key-id -> GPG_KEY_ID, and so on.
     - name: Load signing secrets into the environment
       uses: aws-actions/aws-secretsmanager-get-secrets@2297f9a879480a9e3af9b293ed15c70caf8e1c88 # v3.0.2
       with:
-        secret-ids: ${{ inputs.aws_secret_id }}
+        secret-ids: ",${{ inputs.aws_secret_id }}"
         parse-json-secrets: true
 
-    - name: Export Garasign and GPG variables
+    # Garasign reads its credentials from an env file, so they never appear on a command line.
+    # sign-artifacts reads the same fixed path.
+    - name: Write Garasign env file
       shell: bash
-      env:
-        AWS_SECRET_ID: ${{ inputs.aws_secret_id }}
       run: |
         set -eu
-        # aws-secretsmanager-get-secrets exports each JSON key as
-        # <SECRET_ID>_<KEY>, upper-cased with "-" and "/" folded to "_".
-        # Strip that prefix so the keys become GARASIGN_USERNAME, GPG_KEY_ID, ...
-        prefix="$(echo "$AWS_SECRET_ID" | tr '[:lower:]' '[:upper:]' | sed -r 's/[-/]+/_/g')_"
-        for var in $(compgen -A variable | grep "^${prefix}" || true); do
-          declare "${var#"$prefix"}=${!var}"
-        done
-        : "${GARASIGN_USERNAME:?missing garasign-username in $AWS_SECRET_ID}"
-        : "${GARASIGN_PASSWORD:?missing garasign-password in $AWS_SECRET_ID}"
-        : "${GPG_KEY_ID:?missing gpg-key-id in $AWS_SECRET_ID}"
+        : "${GARASIGN_USERNAME:?missing garasign-username in the signing secret}"
+        : "${GARASIGN_PASSWORD:?missing garasign-password in the signing secret}"
 
         umask 077
-        GARASIGN_ENVFILE="${RUNNER_TEMP}/garasign-envfile"
-        cat > "$GARASIGN_ENVFILE" <<ENVEOF
-        GRS_CONFIG_USER1_USERNAME=$GARASIGN_USERNAME
-        GRS_CONFIG_USER1_PASSWORD=$GARASIGN_PASSWORD
-        ENVEOF
-
-        {
-          echo "GARASIGN_ENVFILE=$GARASIGN_ENVFILE"
-          echo "GPG_KEY_ID=$GPG_KEY_ID"
-          echo "GPG_PUBLIC_URL=${GPG_PUBLIC_URL:-}"
-        } >> "$GITHUB_ENV"
+        printf 'GRS_CONFIG_USER1_USERNAME=%s\nGRS_CONFIG_USER1_PASSWORD=%s\n' \
+          "$GARASIGN_USERNAME" "$GARASIGN_PASSWORD" > "${RUNNER_TEMP}/garasign-envfile"
