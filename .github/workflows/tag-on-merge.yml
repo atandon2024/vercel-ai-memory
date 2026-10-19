@@ -50,3 +50,5 @@ jobs:
       id-token: write
     secrets:
       NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+      GRS_CONFIG_USER1_USERNAME: ${{ secrets.GRS_CONFIG_USER1_USERNAME }}
+      GRS_CONFIG_USER1_PASSWORD: ${{ secrets.GRS_CONFIG_USER1_PASSWORD }}

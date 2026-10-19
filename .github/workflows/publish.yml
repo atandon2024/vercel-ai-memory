@@ -9,6 +9,10 @@ on:
     secrets:
       NPM_TOKEN:
         required: true
+      GRS_CONFIG_USER1_USERNAME:
+        required: true
+      GRS_CONFIG_USER1_PASSWORD:
+        required: true
 
 jobs:
   publish:
@@ -40,7 +44,50 @@ jobs:
       - name: Build
         run: npm run build
 
+      # Pack once so the tarball that is signed is the exact tarball that is published.
+      - name: Pack tarball
+        id: pack
+        run: |
+          tarball=$(npm pack --json | jq -r '.[0].filename')
+          echo "tarball=$tarball" >> "$GITHUB_OUTPUT"
+
+      # Sign with Garasign (HSM-backed PGP). Credentials are passed through the environment,
+      # never as command-line arguments. Needs vars ECR_ROLE_ARN / ECR_REGISTRY from DevProd
+      # Platforms and GRS credentials from DevProd Release Infrastructure (DEVPROD ticket).
+      - name: Configure AWS credentials for DevProd Platforms ECR
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.ECR_ROLE_ARN }}
+          aws-region: us-east-1
+
+      - name: Authenticate Docker to DevProd Platforms ECR
+        run: |
+          aws ecr get-login-password --region us-east-1 |
+            docker login --username AWS --password-stdin "${{ vars.ECR_REGISTRY }}"
+
+      # TODO: confirm with Release Infrastructure whether a key id (gpg -u) is needed.
+      - name: Sign tarball with Garasign (gpg)
+        env:
+          GRS_CONFIG_USER1_USERNAME: ${{ secrets.GRS_CONFIG_USER1_USERNAME }}
+          GRS_CONFIG_USER1_PASSWORD: ${{ secrets.GRS_CONFIG_USER1_PASSWORD }}
+          TARBALL: ${{ steps.pack.outputs.tarball }}
+        run: |
+          docker run --rm \
+            -e GRS_CONFIG_USER1_USERNAME -e GRS_CONFIG_USER1_PASSWORD \
+            -v "$PWD:$PWD" -w "$PWD" \
+            "${{ vars.ECR_REGISTRY }}/release-infrastructure/garasign-gpg" \
+            /bin/bash -c "gpgloader && gpg --yes -v --armor -o '$TARBALL.sig' --detach-sign '$TARBALL'"
+          test -s "$TARBALL.sig"
+
+      - name: Upload tarball and signature
+        uses: actions/upload-artifact@v4
+        with:
+          name: signed-release
+          path: |
+            ${{ steps.pack.outputs.tarball }}
+            ${{ steps.pack.outputs.tarball }}.sig
+
       - name: Publish to npm
-        run: npm publish --access public --provenance
+        run: npm publish "${{ steps.pack.outputs.tarball }}" --access public --provenance
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
