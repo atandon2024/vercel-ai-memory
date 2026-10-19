@@ -1,5 +1,16 @@
 name: Publish to npm
 
+# Build once, sign the exact tarball with Garasign, publish that tarball to npm, then attach the
+# tarball, its detached signature and SHA256SUMS to the GitHub Release so users can verify it.
+# Design follows mongodb-developer/claude-agent-sdk-mongodb-session-store#8.
+#
+# One-time setup before the sign job can run:
+#   - GitHub environment `release-signing` (with required reviewers) holding secrets
+#     AWS_SIGNING_ROLE_ARN, AWS_SIGNING_REGION, AWS_SIGNING_SECRET_ID
+#   - AWS Secrets Manager secret with garasign-username, garasign-password, gpg-key-id
+#   - AWS role trust policies updated for this repo's OIDC subject (the signing-secrets role and
+#     the ecr-role-gha-ro pull role)
+
 on:
   push:
     tags:
@@ -9,28 +20,29 @@ on:
     secrets:
       NPM_TOKEN:
         required: true
-      GRS_CONFIG_USER1_USERNAME:
-        required: true
-      GRS_CONFIG_USER1_PASSWORD:
-        required: true
+
+permissions:
+  contents: read
 
 jobs:
-  publish:
-    name: Build & publish
+  build:
+    name: Build & pack
     runs-on: ubuntu-latest
-    permissions:
-      contents: write  # attach tarball + signature to the GitHub Release
-      id-token: write  # required for npm provenance and AWS OIDC
+    outputs:
+      tarball: ${{ steps.pack.outputs.tarball }}
+      version: ${{ steps.pack.outputs.version }}
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1
         with:
+          package-manager-cache: false
           node-version: '20'
-          registry-url: 'https://registry.npmjs.org'
 
       - name: Install dependencies
         run: npm ci
@@ -48,58 +60,120 @@ jobs:
       - name: Pack tarball
         id: pack
         run: |
-          tarball=$(npm pack --json | jq -r '.[0].filename')
+          mkdir dist-pack
+          tarball=$(npm pack --json --pack-destination dist-pack | jq -r '.[0].filename')
           echo "tarball=$tarball" >> "$GITHUB_OUTPUT"
-          echo "version=$(jq -c '.version' package.json)" >> "$GITHUB_OUTPUT"
+          echo "version=$(jq -r '.version' package.json)" >> "$GITHUB_OUTPUT"
 
-      # Sign with Garasign (HSM-backed PGP). Credentials are passed through the environment,
-      # never as command-line arguments. Needs vars ECR_ROLE_ARN / ECR_REGISTRY from DevProd
-      # Platforms and GRS credentials from DevProd Release Infrastructure (DEVPROD ticket).
-      - name: Configure AWS credentials for DevProd Platforms ECR
-        uses: aws-actions/configure-aws-credentials@v4
+      - name: Upload tarball
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
-          role-to-assume: ${{ vars.ECR_ROLE_ARN }}
-          aws-region: us-east-1
+          name: dist
+          path: dist-pack/
+          if-no-files-found: error
 
-      - name: Authenticate Docker to DevProd Platforms ECR
-        run: |
-          aws ecr get-login-password --region us-east-1 |
-            docker login --username AWS --password-stdin "${{ vars.ECR_REGISTRY }}"
+  sign:
+    name: Sign tarball
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment: release-signing
+    permissions:
+      contents: read
+      id-token: write  # assume the AWS roles via OIDC
 
-      # TODO: confirm with Release Infrastructure whether a key id (gpg -u) is needed.
-      - name: Sign tarball with Garasign (gpg)
-        env:
-          GRS_CONFIG_USER1_USERNAME: ${{ secrets.GRS_CONFIG_USER1_USERNAME }}
-          GRS_CONFIG_USER1_PASSWORD: ${{ secrets.GRS_CONFIG_USER1_PASSWORD }}
-          TARBALL: ${{ steps.pack.outputs.tarball }}
-        run: |
-          docker run --rm \
-            -e GRS_CONFIG_USER1_USERNAME -e GRS_CONFIG_USER1_PASSWORD \
-            -v "$PWD:$PWD" -w "$PWD" \
-            "${{ vars.ECR_REGISTRY }}/release-infrastructure/garasign-gpg" \
-            /bin/bash -c "gpgloader && gpg --yes -v --armor -o '$TARBALL.sig' --detach-sign '$TARBALL'"
-          test -s "$TARBALL.sig"
-
-      - name: Upload tarball and signature
-        uses: actions/upload-artifact@v4
+    steps:
+      # Local composite actions are read from the repo, so check it out first.
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
-          name: signed-release
-          path: |
-            ${{ steps.pack.outputs.tarball }}
-            ${{ steps.pack.outputs.tarball }}.sig
+          persist-credentials: false
+
+      - name: Download tarball
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
+        with:
+          name: dist
+          path: dist-pack/
+
+      - name: Set up signing credentials
+        uses: $/.github/actions/release-setup
+        with:
+          aws_role_arn: ${{ secrets.AWS_SIGNING_ROLE_ARN }}
+          aws_region: ${{ secrets.AWS_SIGNING_REGION }}
+          aws_secret_id: ${{ secrets.AWS_SIGNING_SECRET_ID }}
+
+      - name: Sign tarball
+        uses: $/.github/actions/sign-artifacts
+        with:
+          path: dist-pack/
+
+      - name: Upload signatures
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: dist-signatures
+          path: dist-pack/*.sig
+          if-no-files-found: error
+
+  # Waits for `sign` so an unsigned tarball can never be published.
+  publish:
+    name: Publish to npm
+    needs: [build, sign]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write  # required for npm provenance
+
+    steps:
+      - name: Setup Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1
+        with:
+          package-manager-cache: false
+          node-version: '20'
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: Download tarball
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
+        with:
+          name: dist
+          path: dist-pack/
 
       - name: Publish to npm
-        run: npm publish "${{ steps.pack.outputs.tarball }}" --access public --provenance
+        run: npm publish "dist-pack/$TARBALL" --access public --provenance
         env:
+          TARBALL: ${{ needs.build.outputs.tarball }}
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
-      # Make the signature publicly available next to the release so users can verify the
-      # package (the SSDLC compliance report links to it). The workflow artifact above expires
-      # and needs a GitHub login, so it is not a distribution location.
-      - name: Attach tarball and signature to GitHub Release
-        uses: softprops/action-gh-release@v2
+  attach-signatures:
+    name: Attach signature to the release
+    needs: [build, sign, publish]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write  # create the release and upload assets
+
+    steps:
+      - name: Download tarball
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
         with:
-          tag_name: v${{ fromJSON(steps.pack.outputs.version) }}
-          files: |
-            ${{ steps.pack.outputs.tarball }}
-            ${{ steps.pack.outputs.tarball }}.sig
+          name: dist
+          path: dist-pack/
+
+      - name: Download signatures
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
+        with:
+          name: dist-signatures
+          path: dist-pack/
+
+      - name: Checksum the signed tarball
+        run: (cd dist-pack && sha256sum -- *.tgz *.sig > SHA256SUMS)
+
+      # tag-on-merge.yml creates the tag but no GitHub Release, so create one if needed.
+      - name: Upload tarball, signature and checksums to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: v${{ needs.build.outputs.version }}
+        run: |
+          gh release view "$RELEASE_TAG" >/dev/null 2>&1 \
+            || gh release create "$RELEASE_TAG" --verify-tag --title "$RELEASE_TAG" --generate-notes
+          gh release upload "$RELEASE_TAG" --clobber dist-pack/*.tgz dist-pack/*.sig dist-pack/SHA256SUMS
