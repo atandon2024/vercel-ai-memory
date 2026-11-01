@@ -653,6 +653,22 @@ MONGODB_URI=mongodb+srv://user:pass@cluster.mongodb.net/?retryWrites=true&w=majo
 OPENAI_API_KEY=sk-...   # or whichever embedding provider you use
 ```
 
+## Releasing
+
+Publishing to npm happens only when a GitHub Release is published; nothing else
+(merges to `main`, pushed tags, manual workflow runs) publishes.
+
+1. Open a PR that bumps `version` in `package.json` and updates `CHANGELOG.md`; merge it.
+2. On GitHub, **Releases → Draft a new release**, create tag `vX.Y.Z` (matching
+   `package.json`) on `main`, write the release notes, and **Publish release**.
+3. The [Release workflow](.github/workflows/release.yml) runs the tests, builds and
+   packs the tarball, publishes it to npm with provenance, and attaches the tarball
+   and `SHA256SUMS` to the release. It fails before publishing if the tag does not
+   match `package.json`.
+
+**Run workflow** on the Actions tab is a dry run: it tests, builds, and packs but
+never publishes.
+
 ## License
 
 Apache 2.0 — see [LICENSE](./LICENSE)
